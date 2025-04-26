@@ -7,8 +7,9 @@ import { UpdateTaskDto } from './dto/update-task.dto';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { TaskStatus } from './enums/task-status.enum';
-import { PaginationDto } from '../../common/dto/pagination.dto';
+import { GetTasksFilterDto } from '../../common/dto/task-filter.dto';
 import { TaskPriority } from './enums/task-priority.enum';
+import { LoggedInUser } from '../../types/loggedIn-user.interface';
 
 @Injectable()
 export class TasksService {
@@ -45,7 +46,7 @@ export class TasksService {
     }
   }
 
-  async findAll(params: PaginationDto & { status?: TaskStatus; priority?: TaskPriority }): Promise<{ data: Task[]; total: number }> {
+  async findAll(params: GetTasksFilterDto): Promise<{ data: Task[]; total: number }> {
     const { page = 1, limit = 10, status, priority } = params;
     const skip = (page - 1) * limit;
   
@@ -67,62 +68,156 @@ export class TasksService {
   }
   
   async findOne(id: string): Promise<Task> {
-    // Inefficient implementation: two separate database calls
-    const count = await this.tasksRepository.count({ where: { id } });
+    const task = await this.tasksRepository.findOne({
+      where: { id },
+      relations: ['user'],
+    });
 
-    if (count === 0) {
+    if (!task) {
       throw new NotFoundException(`Task with ID ${id} not found`);
     }
 
-    return (await this.tasksRepository.findOne({
-      where: { id },
-      relations: ['user'],
-    })) as Task;
+    return task;
   }
 
   async update(id: string, updateTaskDto: UpdateTaskDto): Promise<Task> {
-    // Inefficient implementation: multiple database calls
-    // and no transaction handling
-      const task = await this.findOne(id);
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
 
+    try {
+      const task = await this.findOne(id);
       const originalStatus = task.status;
 
-      // Directly update each field individually
-    if (updateTaskDto.title) task.title = updateTaskDto.title;
-    if (updateTaskDto.description) task.description = updateTaskDto.description;
-    if (updateTaskDto.status) task.status = updateTaskDto.status;
-    if (updateTaskDto.priority) task.priority = updateTaskDto.priority;
-    if (updateTaskDto.dueDate) task.dueDate = updateTaskDto.dueDate;
+      Object.assign(task, updateTaskDto);
+      const updatedTask = await queryRunner.manager.save(task);
 
-    const updatedTask = await this.tasksRepository.save(task);
-
-    // Add to queue if status changed, but without proper error handling
       if (originalStatus !== updatedTask.status) {
-        this.taskQueue.add('task-status-update', {
+        await this.taskQueue.add('task-status-update', {
           taskId: updatedTask.id,
           status: updatedTask.status,
         });
       }
 
-            return updatedTask;
-      }
-
-  async remove(id: string): Promise<void> {
-    // Inefficient implementation: two separate database calls
-      const task = await this.findOne(id);
-      await this.tasksRepository.remove(task);
+      await queryRunner.commitTransaction();
+      return updatedTask;
+    } catch (error) {
+      await queryRunner.rollbackTransaction();
+      throw new BadRequestException('Failed to update task');
+    } finally {
+      await queryRunner.release();
+    }
   }
 
-  async findByStatus(status: TaskStatus): Promise<Task[]> {
-    // Inefficient implementation: doesn't use proper repository patterns
-    const query = 'SELECT * FROM tasks WHERE status = $1';
-    return this.tasksRepository.query(query, [status]);
+  async remove(id: string): Promise<void> {
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+
+    try {
+      const task = await this.findOne(id);
+      await queryRunner.manager.remove(task);
+      await queryRunner.commitTransaction();
+    } catch (error) {
+      await queryRunner.rollbackTransaction();
+      throw new BadRequestException('Failed to delete task');
+    } finally {
+      await queryRunner.release();
+    }
   }
 
   async updateStatus(id: string, status: string): Promise<Task> {
-    // This method will be called by the task processor
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+
+    try {
       const task = await this.findOne(id);
-      task.status = status as any;
-    return this.tasksRepository.save(task);
+      task.status = status as TaskStatus;
+      const updatedTask = await queryRunner.manager.save(task);
+      await queryRunner.commitTransaction();
+      return updatedTask;
+    } catch (error) {
+      await queryRunner.rollbackTransaction();
+      throw new BadRequestException('Failed to update task status');
+    } finally {
+      await queryRunner.release();
+    }
   }
+
+  async getStats() {
+    const query = `
+      SELECT 
+        COUNT(*) as total,
+        SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END) as completed,
+        SUM(CASE WHEN status = 'IN_PROGRESS' THEN 1 ELSE 0 END) as inProgress,
+        SUM(CASE WHEN status = 'PENDING' THEN 1 ELSE 0 END) as pending,
+        SUM(CASE WHEN priority = 'HIGH' THEN 1 ELSE 0 END) as highPriority
+      FROM tasks
+    `;
+
+    const stats = await this.tasksRepository.query(query);
+    return stats[0];
+  }
+
+  async batchProcess(operations: { tasks: string[]; action: string }, user: LoggedInUser) {
+    const { tasks: taskIds, action } = operations;
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+  
+    try {
+      const results = [];
+  
+      for (const taskId of taskIds) {
+        try {
+          const task = await this.tasksRepository.findOne({
+            where: { id: taskId },
+          });
+  
+          if (!task) {
+            results.push({ taskId, success: false, error: 'Task not found' });
+            continue;
+          }
+  
+          // Check if user is not admin and trying to modify other's task
+          if (user.role !== 'admin' && task.userId !== user.id) {
+            results.push({ taskId, success: false, error: 'Unauthorized access to task' });
+            continue;
+          }
+  
+          let result;
+          switch (action) {
+            case 'complete':
+              task.status = TaskStatus.COMPLETED;
+              result = await queryRunner.manager.save(task);
+              break;
+            case 'delete':
+              await queryRunner.manager.remove(task);
+              result = { message: 'Task deleted' };
+              break;
+            default:
+              throw new BadRequestException(`Unknown action: ${action}`);
+          }
+  
+          results.push({ taskId, success: true, result });
+        } catch (error) {
+          results.push({
+            taskId,
+            success: false,
+            error: error instanceof Error ? error.message : 'Unknown error',
+          });
+        }
+      }
+  
+      await queryRunner.commitTransaction();
+      return results;
+    } catch (error) {
+      await queryRunner.rollbackTransaction();
+      throw new BadRequestException('Failed to process batch operations');
+    } finally {
+      await queryRunner.release();
+    }
+  }
+  
 }
