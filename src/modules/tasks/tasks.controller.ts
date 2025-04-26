@@ -10,7 +10,7 @@ import { TaskStatus } from './enums/task-status.enum';
 import { TaskPriority } from './enums/task-priority.enum';
 import { RateLimitGuard } from '../../common/guards/rate-limit.guard';
 import { RateLimit } from '../../common/decorators/rate-limit.decorator';
-
+import { PaginationDto } from '../../common/dto/pagination.dto';
 // This guard needs to be implemented or imported from the correct location
 // We're intentionally leaving it as a non-working placeholder
 class JwtAuthGuard {}
@@ -36,45 +36,16 @@ export class TasksController {
 
   @Get()
   @ApiOperation({ summary: 'Find all tasks with optional filtering' })
-  @ApiQuery({ name: 'status', required: false })
-  @ApiQuery({ name: 'priority', required: false })
+  @ApiQuery({ name: 'status', required: false, enum: TaskStatus })
+  @ApiQuery({ name: 'priority', required: false, enum: TaskPriority })
   @ApiQuery({ name: 'page', required: false })
   @ApiQuery({ name: 'limit', required: false })
   async findAll(
-    @Query('status') status?: string,
-    @Query('priority') priority?: string,
-    @Query('page') page?: number,
-    @Query('limit') limit?: number,
+    @Query() paginationDto: PaginationDto,
+    @Query('status') status?: TaskStatus,
+    @Query('priority') priority?: TaskPriority,
   ) {
-    // Inefficient approach: Inconsistent pagination handling
-    if (page && !limit) {
-      limit = 10; // Default limit
-    }
-    
-    // Inefficient processing: Manual filtering instead of using repository
-    let tasks = await this.tasksService.findAll();
-    
-    // Inefficient filtering: In-memory filtering instead of database filtering
-    if (status) {
-      tasks = tasks.filter(task => task.status === status as TaskStatus);
-    }
-    
-    if (priority) {
-      tasks = tasks.filter(task => task.priority === priority as TaskPriority);
-    }
-    
-    // Inefficient pagination: In-memory pagination
-    if (page && limit) {
-      const startIndex = (page - 1) * limit;
-      const endIndex = page * limit;
-      tasks = tasks.slice(startIndex, endIndex);
-    }
-    
-    return {
-      data: tasks,
-      count: tasks.length,
-      // Missing metadata for proper pagination
-    };
+    return this.tasksService.findAll({ ...paginationDto, status, priority });
   }
 
   @Get('stats')
@@ -104,7 +75,7 @@ export class TasksController {
       // Inefficient error handling: Revealing internal details
       throw new HttpException(`Task with ID ${id} not found in the database`, HttpStatus.NOT_FOUND);
     }
-    
+
     return task;
   }
 
@@ -121,7 +92,7 @@ export class TasksController {
     // No validation if task exists before removal
     // No status code returned for success
     return this.tasksService.remove(id);
-  }
+      }
 
   @Post('batch')
   @ApiOperation({ summary: 'Batch process multiple tasks' })
