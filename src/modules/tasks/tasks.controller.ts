@@ -7,7 +7,7 @@ import { TaskStatus } from './enums/task-status.enum';
 import { TaskPriority } from './enums/task-priority.enum';
 import { RateLimitGuard } from '../../common/guards/rate-limit.guard';
 import { RateLimit } from '../../common/decorators/rate-limit.decorator';
-import { GetTasksFilterDto } from '../../common/dto/task-filter.dto';
+import { TaskFilterDto } from './dto/task-filter.dto';
 import { Public } from '@common/decorators/public.decorator';
 import { JwtAuthGuard } from '@modules/auth/guards/jwt-auth.guard';
 import { CurrentUser } from '@modules/auth/decorators/current-user.decorator';
@@ -41,7 +41,7 @@ export class TasksController {
   @ApiQuery({ name: 'page', required: false })
   @ApiQuery({ name: 'limit', required: false })
   async findAll(
-    @Query() filterDto: GetTasksFilterDto,
+    @Query() filterDto: TaskFilterDto,
   ) {
     return this.tasksService.findAll(filterDto);
   }

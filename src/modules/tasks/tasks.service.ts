@@ -7,9 +7,10 @@ import { UpdateTaskDto } from './dto/update-task.dto';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { TaskStatus } from './enums/task-status.enum';
-import { GetTasksFilterDto } from '../../common/dto/task-filter.dto';
+import { TaskResponseDto } from './dto/task-response.dto';
 import { TaskPriority } from './enums/task-priority.enum';
 import { LoggedInUser } from '../../types/loggedIn-user.interface';
+import { TaskFilterDto } from './dto/task-filter.dto';
 
 @Injectable()
 export class TasksService {
@@ -21,7 +22,33 @@ export class TasksService {
     private dataSource: DataSource,
   ) {}
 
-  async create(createTaskDto: CreateTaskDto): Promise<Task> {
+  private toResponseDto(task: Task): TaskResponseDto {
+    return {
+      id: task.id,
+      title: task.title,
+      description: task.description,
+      status: task.status,
+      priority: task.priority,
+      dueDate: task.dueDate,
+      userId: task.user?.id || task.userId,
+      createdAt: task.createdAt,
+      updatedAt: task.updatedAt,
+    };
+  }
+
+  private async  findTaskEntity(id: string): Promise<Task> {
+    const task = await this.tasksRepository.findOne({
+      where: { id },
+      relations: ['user'],
+    });
+    
+    if (!task) {
+      throw new NotFoundException(`Task with ID ${id} not found`);
+    }
+    return task;
+  }
+
+  async create(createTaskDto: CreateTaskDto): Promise<TaskResponseDto> {
     const queryRunner = this.dataSource.createQueryRunner();
     await queryRunner.connect();
     await queryRunner.startTransaction();
@@ -30,14 +57,13 @@ export class TasksService {
       const task = this.tasksRepository.create(createTaskDto);
       const savedTask = await queryRunner.manager.save(task);
 
-      // Add to queue with proper error handling
       await this.taskQueue.add('task-status-update', {
         taskId: savedTask.id,
         status: savedTask.status,
       });
 
       await queryRunner.commitTransaction();
-      return savedTask;
+      return this.toResponseDto(savedTask);
     } catch (error) {
       await queryRunner.rollbackTransaction();
       throw new BadRequestException('Failed to create task');
@@ -46,7 +72,7 @@ export class TasksService {
     }
   }
 
-  async findAll(params: GetTasksFilterDto): Promise<{ data: Task[]; total: number }> {
+  async findAll(params: TaskFilterDto): Promise<{ data: TaskResponseDto[]; total: number }> {
     const { page = 1, limit = 10, status, priority } = params;
     const skip = (page - 1) * limit;
   
@@ -64,29 +90,28 @@ export class TasksService {
       },
     });
   
-    return { data: tasks, total };
+    return { 
+      data: tasks.map(task => this.toResponseDto(task)),
+      total 
+    };
   }
   
-  async findOne(id: string): Promise<Task> {
-    const task = await this.tasksRepository.findOne({
-      where: { id },
-      relations: ['user'],
-    });
-
-    if (!task) {
-      throw new NotFoundException(`Task with ID ${id} not found`);
-    }
-
-    return task;
+  async findOne(id: string): Promise<TaskResponseDto> {
+    const task = await this.findTaskEntity(id);
+    return this.toResponseDto(task);
   }
 
-  async update(id: string, updateTaskDto: UpdateTaskDto): Promise<Task> {
+  async update(id: string, updateTaskDto: UpdateTaskDto): Promise<TaskResponseDto> {
     const queryRunner = this.dataSource.createQueryRunner();
     await queryRunner.connect();
     await queryRunner.startTransaction();
 
     try {
-      const task = await this.findOne(id);
+      const task = await this.findTaskEntity(id);
+      if (!task) {
+        throw new NotFoundException(`Task with ID ${id} not found`);
+      }
+
       const originalStatus = task.status;
 
       Object.assign(task, updateTaskDto);
@@ -100,7 +125,7 @@ export class TasksService {
       }
 
       await queryRunner.commitTransaction();
-      return updatedTask;
+      return this.toResponseDto(updatedTask);
     } catch (error) {
       await queryRunner.rollbackTransaction();
       throw new BadRequestException('Failed to update task');
@@ -115,7 +140,10 @@ export class TasksService {
     await queryRunner.startTransaction();
 
     try {
-      const task = await this.findOne(id);
+      const task = await this.findTaskEntity(id);
+      if (!task) {
+        throw new NotFoundException(`Task with ID ${id} not found`);
+      }
       await queryRunner.manager.remove(task);
       await queryRunner.commitTransaction();
     } catch (error) {
@@ -126,17 +154,21 @@ export class TasksService {
     }
   }
 
-  async updateStatus(id: string, status: string): Promise<Task> {
+  async updateStatus(id: string, status: string): Promise<TaskResponseDto> {
     const queryRunner = this.dataSource.createQueryRunner();
     await queryRunner.connect();
     await queryRunner.startTransaction();
 
     try {
-      const task = await this.findOne(id);
+      const task = await this.findTaskEntity(id);
+      if (!task) {
+        throw new NotFoundException(`Task with ID ${id} not found`);
+      }
+
       task.status = status as TaskStatus;
       const updatedTask = await queryRunner.manager.save(task);
       await queryRunner.commitTransaction();
-      return updatedTask;
+      return this.toResponseDto(updatedTask);
     } catch (error) {
       await queryRunner.rollbackTransaction();
       throw new BadRequestException('Failed to update task status');
@@ -180,7 +212,6 @@ export class TasksService {
             continue;
           }
   
-          // Check if user is not admin and trying to modify other's task
           if (user.role !== 'admin' && task.userId !== user.id) {
             results.push({ taskId, success: false, error: 'Unauthorized access to task' });
             continue;
@@ -190,7 +221,8 @@ export class TasksService {
           switch (action) {
             case 'complete':
               task.status = TaskStatus.COMPLETED;
-              result = await queryRunner.manager.save(task);
+              const savedTask = await queryRunner.manager.save(task);
+              result = this.toResponseDto(savedTask);
               break;
             case 'delete':
               await queryRunner.manager.remove(task);
@@ -219,5 +251,5 @@ export class TasksService {
       await queryRunner.release();
     }
   }
-  
+
 }
