@@ -62,4 +62,16 @@ export class CacheService {
       return false;
     }
   }
+
+  async deleteByPattern(pattern: string): Promise<void> {
+    try {
+      const keys = await this.redis.keys(pattern);
+      if (keys.length) {
+        await this.redis.del(...keys);
+      }
+      this.logger.debug(`Deleted cache keys matching pattern: ${pattern}`);
+    } catch (err) {
+      this.logger.error(`Error deleting cache keys by pattern "${pattern}":`, err);
+    }
+  }
 }

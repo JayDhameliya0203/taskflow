@@ -11,15 +11,21 @@ import { TaskResponseDto } from './dto/task-response.dto';
 import { TaskPriority } from './enums/task-priority.enum';
 import { LoggedInUser } from '../../types/loggedIn-user.interface';
 import { TaskFilterDto } from './dto/task-filter.dto';
+import { CacheService } from '@common/services/cache.service';
 
 @Injectable()
 export class TasksService {
+  private readonly CACHE_TTL = 300; // 5 minutes in seconds
+  private readonly TASKS_LIST_CACHE_PREFIX = 'tasks:list:';
+  private readonly TASK_STATS_CACHE_KEY = 'tasks:stats';
+
   constructor(
     @InjectRepository(Task)
     private tasksRepository: Repository<Task>,
     @InjectQueue('task-processing')
     private taskQueue: Queue,
     private dataSource: DataSource,
+    private readonly cacheService: CacheService,
   ) {}
 
   private toResponseDto(task: Task): TaskResponseDto {
@@ -36,15 +42,32 @@ export class TasksService {
     };
   }
 
-  private async  findTaskEntity(id: string): Promise<Task> {
+  private getTaskCacheKey(id: string): string {
+    return `task:id:${id}`;
+  }
+
+  private getTasksListCacheKey(filterDto: TaskFilterDto): string {
+    const { page = 1, limit = 10, status, priority } = filterDto;
+    return `${this.TASKS_LIST_CACHE_PREFIX}${status || 'all'}:${priority || 'all'}:${page}:${limit}`;
+  }
+
+  private async findTaskEntity(id: string): Promise<Task> {
+    const cacheKey = this.getTaskCacheKey(id);
+
+    const cached = await this.cacheService.get<Task>(cacheKey);
+    if (cached) return cached;
+
     const task = await this.tasksRepository.findOne({
       where: { id },
       relations: ['user'],
     });
-    
+
     if (!task) {
       throw new NotFoundException(`Task with ID ${id} not found`);
     }
+
+    await this.cacheService.set(cacheKey, task, this.CACHE_TTL);
+
     return task;
   }
 
@@ -62,6 +85,11 @@ export class TasksService {
         status: savedTask.status,
       });
 
+      // Invalidate all tasks lists cache (since we added a new task)
+      await this.cacheService.deleteByPattern(`${this.TASKS_LIST_CACHE_PREFIX}*`);
+      // Invalidate stats cache
+      await this.cacheService.delete(this.TASK_STATS_CACHE_KEY);
+
       await queryRunner.commitTransaction();
       return this.toResponseDto(savedTask);
     } catch (error) {
@@ -73,13 +101,20 @@ export class TasksService {
   }
 
   async findAll(params: TaskFilterDto): Promise<{ data: TaskResponseDto[]; total: number }> {
+    const cacheKey = this.getTasksListCacheKey(params);
+
+    const cached = await this.cacheService.get<{ data: TaskResponseDto[]; total: number }>(
+      cacheKey,
+    );
+    if (cached) return cached;
+
     const { page = 1, limit = 10, status, priority } = params;
     const skip = (page - 1) * limit;
-  
+
     const where: { status?: TaskStatus; priority?: TaskPriority } = {};
     if (status) where.status = status;
     if (priority) where.priority = priority;
-  
+
     const [tasks, total] = await this.tasksRepository.findAndCount({
       where,
       relations: ['user'],
@@ -89,13 +124,18 @@ export class TasksService {
         createdAt: 'DESC',
       },
     });
-  
-    return { 
+
+    const result = {
       data: tasks.map(task => this.toResponseDto(task)),
-      total 
+      total,
     };
+
+    // Cache the result
+    await this.cacheService.set(cacheKey, result, this.CACHE_TTL);
+
+    return result;
   }
-  
+
   async findOne(id: string): Promise<TaskResponseDto> {
     const task = await this.findTaskEntity(id);
     return this.toResponseDto(task);
@@ -124,6 +164,13 @@ export class TasksService {
         });
       }
 
+      // Update/invalidate cache
+      await Promise.all([
+        this.cacheService.set(this.getTaskCacheKey(id), updatedTask, this.CACHE_TTL),
+        this.cacheService.deleteByPattern(`${this.TASKS_LIST_CACHE_PREFIX}*`),
+        this.cacheService.delete(this.TASK_STATS_CACHE_KEY),
+      ]);
+
       await queryRunner.commitTransaction();
       return this.toResponseDto(updatedTask);
     } catch (error) {
@@ -145,6 +192,14 @@ export class TasksService {
         throw new NotFoundException(`Task with ID ${id} not found`);
       }
       await queryRunner.manager.remove(task);
+
+      // Invalidate cache
+      await Promise.all([
+        this.cacheService.delete(this.getTaskCacheKey(id)),
+        this.cacheService.deleteByPattern(`${this.TASKS_LIST_CACHE_PREFIX}*`),
+        this.cacheService.delete(this.TASK_STATS_CACHE_KEY),
+      ]);
+
       await queryRunner.commitTransaction();
     } catch (error) {
       await queryRunner.rollbackTransaction();
@@ -178,6 +233,12 @@ export class TasksService {
   }
 
   async getStats() {
+    const cacheKey = this.TASK_STATS_CACHE_KEY;
+
+    // Try cache first
+    const cached = await this.cacheService.get<any>(cacheKey);
+    if (cached) return cached;
+
     const query = `
       SELECT 
         COUNT(*) as total,
@@ -189,7 +250,11 @@ export class TasksService {
     `;
 
     const stats = await this.tasksRepository.query(query);
-    return stats[0];
+    const result = stats[0];
+
+    await this.cacheService.set(cacheKey, result, this.CACHE_TTL);
+
+    return result;
   }
 
   async batchProcess(operations: { tasks: string[]; action: string }, user: LoggedInUser) {
@@ -197,26 +262,26 @@ export class TasksService {
     const queryRunner = this.dataSource.createQueryRunner();
     await queryRunner.connect();
     await queryRunner.startTransaction();
-  
+
     try {
       const results = [];
-  
+
       for (const taskId of taskIds) {
         try {
           const task = await this.tasksRepository.findOne({
             where: { id: taskId },
           });
-  
+
           if (!task) {
             results.push({ taskId, success: false, error: 'Task not found' });
             continue;
           }
-  
+
           if (user.role !== 'admin' && task.userId !== user.id) {
             results.push({ taskId, success: false, error: 'Unauthorized access to task' });
             continue;
           }
-  
+
           let result;
           switch (action) {
             case 'complete':
@@ -231,7 +296,7 @@ export class TasksService {
             default:
               throw new BadRequestException(`Unknown action: ${action}`);
           }
-  
+
           results.push({ taskId, success: true, result });
         } catch (error) {
           results.push({
@@ -241,7 +306,7 @@ export class TasksService {
           });
         }
       }
-  
+
       await queryRunner.commitTransaction();
       return results;
     } catch (error) {
@@ -251,5 +316,4 @@ export class TasksService {
       await queryRunner.release();
     }
   }
-
 }
