@@ -46,7 +46,8 @@ export class UsersController {
     description:
       'Unauthorized user',
   })
-  fidAll(): Promise<UserResponseDto[]> {
+  findAll(): Promise<UserResponseDto[]> {
+    console.log("inside controller")
     return this.usersService.findAll();
   }
 
