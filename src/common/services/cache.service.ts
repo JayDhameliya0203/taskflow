@@ -19,7 +19,6 @@ export class CacheService {
 
   async get<T>(key: string): Promise<T | null> {
     try {
-      console.log("clled")
       const result = await this.redis.get(key);
       if (!result) {
         this.logger.debug(`Cache miss: ${key}`);
