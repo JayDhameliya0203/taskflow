@@ -40,6 +40,7 @@ export class TasksController {
   @ApiQuery({ name: 'priority', required: false, enum: TaskPriority })
   @ApiQuery({ name: 'page', required: false })
   @ApiQuery({ name: 'limit', required: false })
+  @RateLimit({ limit: 10, windowMs: 60000 })
   async findAll(
     @Query() filterDto: TaskFilterDto,
   ) {
